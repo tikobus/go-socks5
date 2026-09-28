@@ -1,8 +1,8 @@
-go-socks5 [![Build Status](https://travis-ci.org/armon/go-socks5.png)](https://travis-ci.org/armon/go-socks5)
+go-socks5
 =========
 
 Provides the `socks5` package that implements a [SOCKS5 server](http://en.wikipedia.org/wiki/SOCKS).
-SOCKS (Secure Sockets) is used to route traffic between a client and server through
+SOCKS (Socket Secure) is used to route traffic between a client and server through
 an intermediate proxy layer. This can be used to bypass firewalls or NATs.
 
 Feature
@@ -12,8 +12,10 @@ The package has the following features:
 * "No Auth" mode
 * User/Password authentication
 * Support for the CONNECT command
+* Support for the UDP ASSOCIATE command
 * Rules to do granular filtering of commands
 * Custom DNS resolution
+* Connection limiting, handshake and idle timeouts
 * Unit tests
 
 TODO
@@ -21,7 +23,6 @@ TODO
 
 The package still needs the following:
 * Support for the BIND command
-* Support for the ASSOCIATE command
 
 
 Example

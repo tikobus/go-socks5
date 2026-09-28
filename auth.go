@@ -3,6 +3,7 @@ package socks5
 import (
 	"fmt"
 	"io"
+	"time"
 )
 
 const (
@@ -13,6 +14,10 @@ const (
 	authSuccess     = uint8(0)
 	authFailure     = uint8(1)
 )
+
+// authFailureDelay is applied before sending a failure reply, so that
+// credential guesses cannot be brute-forced at line speed.
+const authFailureDelay = 250 * time.Millisecond
 
 var (
 	UserAuthFailed  = fmt.Errorf("User authentication failed")
@@ -26,7 +31,7 @@ type AuthContext struct {
 	Method uint8
 	// Payload provided during negotiation.
 	// Keys depend on the used auth method.
-	// For UserPassauth contains Username
+	// For UserPassAuth contains the Username
 	Payload map[string]string
 }
 
@@ -82,7 +87,7 @@ func (a UserPassAuthenticator) Authenticate(reader io.Reader, writer io.Writer) 
 	}
 
 	// Get the password length
-	if _, err := reader.Read(header[:1]); err != nil {
+	if _, err := io.ReadFull(reader, header[:1]); err != nil {
 		return nil, err
 	}
 
@@ -99,6 +104,8 @@ func (a UserPassAuthenticator) Authenticate(reader io.Reader, writer io.Writer) 
 			return nil, err
 		}
 	} else {
+		// Throttle before replying to slow down brute-force attempts.
+		time.Sleep(authFailureDelay)
 		if _, err := writer.Write([]byte{userAuthVersion, authFailure}); err != nil {
 			return nil, err
 		}
@@ -117,10 +124,16 @@ func (s *Server) authenticate(conn io.Writer, bufConn io.Reader) (*AuthContext, 
 		return nil, fmt.Errorf("Failed to get auth methods: %v", err)
 	}
 
-	// Select a usable method
+	// Select the first method in server-preference order that the client
+	// offered. Iterating in server order rather than client order prevents
+	// a client from downgrading the negotiation to a weaker method.
+	clientMethods := make(map[uint8]bool, len(methods))
 	for _, method := range methods {
-		cator, found := s.authMethods[method]
-		if found {
+		clientMethods[method] = true
+	}
+
+	for _, cator := range s.config.AuthMethods {
+		if clientMethods[cator.GetCode()] {
 			return cator.Authenticate(bufConn, conn)
 		}
 	}
@@ -137,10 +150,10 @@ func noAcceptableAuth(conn io.Writer) error {
 }
 
 // readMethods is used to read the number of methods
-// and proceeding auth methods
+// and the auth methods that follow
 func readMethods(r io.Reader) ([]byte, error) {
 	header := []byte{0}
-	if _, err := r.Read(header); err != nil {
+	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, err
 	}
 

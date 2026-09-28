@@ -1,13 +1,13 @@
 package socks5
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
-	"strings"
-
-	"golang.org/x/net/context"
+	"syscall"
 )
 
 const (
@@ -50,7 +50,10 @@ type AddrSpec struct {
 
 func (a *AddrSpec) String() string {
 	if a.FQDN != "" {
-		return fmt.Sprintf("%s (%s):%d", a.FQDN, a.IP, a.Port)
+		if a.IP != nil {
+			return fmt.Sprintf("%s (%s):%d", a.FQDN, a.IP, a.Port)
+		}
+		return fmt.Sprintf("%s:%d", a.FQDN, a.Port)
 	}
 	return fmt.Sprintf("%s:%d", a.IP, a.Port)
 }
@@ -58,7 +61,7 @@ func (a *AddrSpec) String() string {
 // Address returns a string suitable to dial; prefer returning IP-based
 // address, fallback to FQDN
 func (a AddrSpec) Address() string {
-	if 0 != len(a.IP) {
+	if len(a.IP) > 0 {
 		return net.JoinHostPort(a.IP.String(), strconv.Itoa(a.Port))
 	}
 	return net.JoinHostPort(a.FQDN, strconv.Itoa(a.Port))
@@ -72,7 +75,7 @@ type Request struct {
 	Command uint8
 	// AuthContext provided during negotiation
 	AuthContext *AuthContext
-	// AddrSpec of the the network that sent the request
+	// AddrSpec of the network that sent the request
 	RemoteAddr *AddrSpec
 	// AddrSpec of the desired destination
 	DestAddr *AddrSpec
@@ -176,11 +179,14 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	}
 	target, err := dial(ctx, "tcp", req.realDestAddr.Address())
 	if err != nil {
-		msg := err.Error()
+		// Map the dial error to a SOCKS5 reply code. Matching on error
+		// values keeps working when errors are wrapped or localized,
+		// unlike matching on the message string.
 		resp := hostUnreachable
-		if strings.Contains(msg, "refused") {
+		switch {
+		case errors.Is(err, syscall.ECONNREFUSED):
 			resp = connectionRefused
-		} else if strings.Contains(msg, "network is unreachable") {
+		case errors.Is(err, syscall.ENETUNREACH):
 			resp = networkUnreachable
 		}
 		if err := sendReply(conn, resp, nil); err != nil {
@@ -190,9 +196,15 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	}
 	defer target.Close()
 
-	// Send success
-	local := target.LocalAddr().(*net.TCPAddr)
-	bind := AddrSpec{IP: local.IP, Port: local.Port}
+	// Send success. Fall back to the unspecified address if the dialed
+	// connection does not expose a *net.TCPAddr (e.g. a custom Dialer
+	// returning a wrapped conn) instead of panicking on the type assertion.
+	var bind AddrSpec
+	if local, ok := target.LocalAddr().(*net.TCPAddr); ok {
+		bind = AddrSpec{IP: local.IP, Port: local.Port}
+	} else {
+		bind = AddrSpec{IP: net.IPv4zero, Port: 0}
+	}
 	if err := sendReply(conn, successReply, &bind); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
@@ -203,7 +215,7 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	go proxy(conn, target, errCh)
 
 	// Wait
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		e := <-errCh
 		if e != nil {
 			// return from this function closes target (and conn).
@@ -213,7 +225,7 @@ func (s *Server) handleConnect(ctx context.Context, conn conn, req *Request) err
 	return nil
 }
 
-// handleBind is used to handle a connect command
+// handleBind is used to handle a bind command
 func (s *Server) handleBind(ctx context.Context, conn conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
@@ -232,7 +244,11 @@ func (s *Server) handleBind(ctx context.Context, conn conn, req *Request) error 
 	return nil
 }
 
-// handleAssociate is used to handle a connect command
+// handleAssociate is used to handle an associate command. It sets up a
+// UDP relay per RFC 1928: datagrams from the client carry a SOCKS5 UDP
+// header naming the destination, and replies are sent back with a
+// header naming the source. The association lives as long as the TCP
+// connection that created it.
 func (s *Server) handleAssociate(ctx context.Context, conn conn, req *Request) error {
 	// Check if this is allowed
 	if ctx_, ok := s.config.Rules.Allow(ctx, req); !ok {
@@ -244,21 +260,134 @@ func (s *Server) handleAssociate(ctx context.Context, conn conn, req *Request) e
 		ctx = ctx_
 	}
 
-	// TODO: Support associate
-	if err := sendReply(conn, commandNotSupported, nil); err != nil {
+	// Bind the UDP relay socket. BindIP selects the local interface when
+	// set. Otherwise bind in the client's address family so the reply
+	// address is dialable by the client (a v6-wildcard socket is not
+	// reachable over v4 on every platform). The client port is learned
+	// from the first datagram.
+	network := "udp"
+	if req.RemoteAddr != nil {
+		if req.RemoteAddr.IP.To4() != nil {
+			network = "udp4"
+		} else {
+			network = "udp6"
+		}
+	}
+	bindAddr := ":0"
+	if s.config.BindIP != nil {
+		bindAddr = net.JoinHostPort(s.config.BindIP.String(), "0")
+	}
+	pc, err := net.ListenPacket(network, bindAddr)
+	if err != nil {
+		if err := sendReply(conn, serverFailure, nil); err != nil {
+			return fmt.Errorf("Failed to send reply: %v", err)
+		}
+		return fmt.Errorf("Failed to bind UDP relay socket: %v", err)
+	}
+	defer pc.Close()
+
+	// Inform the client where to send its UDP datagrams
+	udpLocal := pc.LocalAddr().(*net.UDPAddr)
+	bind := AddrSpec{IP: udpLocal.IP, Port: udpLocal.Port}
+	if err := sendReply(conn, successReply, &bind); err != nil {
 		return fmt.Errorf("Failed to send reply: %v", err)
 	}
-	return nil
+	s.config.Logger.Printf("[INFO] socks: UDP associate from %v relayed via %v", req.RemoteAddr, udpLocal)
+
+	// The association lives as long as the TCP connection: closing the
+	// relay socket when the client disconnects unwinds the loop below.
+	go func(r io.Reader) {
+		io.Copy(io.Discard, r)
+		pc.Close()
+	}(req.bufConn)
+
+	// One connected UDP socket per destination, each with a relayBack
+	// goroutine. Only this goroutine touches the map.
+	targets := make(map[string]*net.UDPConn)
+	defer func() {
+		for _, tconn := range targets {
+			tconn.Close()
+		}
+	}()
+
+	buf := make([]byte, maxUDPDatagram)
+	var clientAddr *net.UDPAddr
+	for {
+		n, from, err := pc.ReadFrom(buf)
+		if err != nil {
+			// Relay socket closed: the client disconnected (or the
+			// server is shutting down).
+			return nil
+		}
+		udpFrom, ok := from.(*net.UDPAddr)
+		if !ok {
+			continue
+		}
+
+		// Only datagrams from the association owner are relayed. The
+		// client port is learned from the first accepted datagram (the
+		// request usually carries 0.0.0.0:0); the source IP must match
+		// the TCP peer when it is known, so the relay cannot be abused
+		// as an open redirector.
+		if clientAddr == nil {
+			if req.RemoteAddr != nil && !req.RemoteAddr.IP.Equal(udpFrom.IP) {
+				continue
+			}
+			clientAddr = udpFrom
+		} else if !udpFrom.IP.Equal(clientAddr.IP) || udpFrom.Port != clientAddr.Port {
+			continue
+		}
+
+		frag, dest, payload, err := unmarshalUDPHeader(buf[:n])
+		if err != nil || frag != 0 {
+			// Malformed or fragmented datagrams are dropped; UDP
+			// fragmentation is not supported.
+			continue
+		}
+
+		// Apply the rule set to the outbound destination
+		outReq := &Request{
+			Version:     req.Version,
+			Command:     req.Command,
+			AuthContext: req.AuthContext,
+			RemoteAddr:  req.RemoteAddr,
+			DestAddr:    dest,
+		}
+		if _, ok := s.config.Rules.Allow(ctx, outReq); !ok {
+			continue
+		}
+
+		target := &net.UDPAddr{IP: dest.IP, Port: dest.Port}
+		if dest.IP == nil {
+			// FQDN destination: resolved by the system resolver (the
+			// configured Resolver applies to TCP destinations).
+			target, err = net.ResolveUDPAddr("udp", dest.Address())
+			if err != nil {
+				continue
+			}
+		}
+
+		tconn := targets[target.String()]
+		if tconn == nil {
+			tconn, err = net.DialUDP("udp", nil, target)
+			if err != nil {
+				continue
+			}
+			targets[target.String()] = tconn
+			go relayBack(pc, tconn, clientAddr)
+		}
+		tconn.Write(payload)
+	}
 }
 
 // readAddrSpec is used to read AddrSpec.
-// Expects an address type byte, follwed by the address and port
+// Expects an address type byte, followed by the address and port
 func readAddrSpec(r io.Reader) (*AddrSpec, error) {
 	d := &AddrSpec{}
 
 	// Get the address type
 	addrType := []byte{0}
-	if _, err := r.Read(addrType); err != nil {
+	if _, err := io.ReadFull(r, addrType); err != nil {
 		return nil, err
 	}
 
@@ -279,7 +408,7 @@ func readAddrSpec(r io.Reader) (*AddrSpec, error) {
 		d.IP = net.IP(addr)
 
 	case fqdnAddress:
-		if _, err := r.Read(addrType); err != nil {
+		if _, err := io.ReadFull(r, addrType); err != nil {
 			return nil, err
 		}
 		addrLen := int(addrType[0])
@@ -353,7 +482,7 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
-// proxy is used to suffle data from src to destination, and sends errors
+// proxy is used to shuffle data from src to destination, and sends errors
 // down a dedicated channel
 func proxy(dst io.Writer, src io.Reader, errCh chan error) {
 	_, err := io.Copy(dst, src)

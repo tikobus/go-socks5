@@ -32,17 +32,20 @@ func TestRequest_Connect(t *testing.T) {
 	go func() {
 		conn, err := l.Accept()
 		if err != nil {
-			t.Fatalf("err: %v", err)
+			t.Errorf("err: %v", err)
+			return
 		}
 		defer conn.Close()
 
 		buf := make([]byte, 4)
 		if _, err := io.ReadAtLeast(conn, buf, 4); err != nil {
-			t.Fatalf("err: %v", err)
+			t.Errorf("err: %v", err)
+			return
 		}
 
 		if !bytes.Equal(buf, []byte("ping")) {
-			t.Fatalf("bad: %v", buf)
+			t.Errorf("bad: %v", buf)
+			return
 		}
 		conn.Write([]byte("pong"))
 	}()
@@ -98,6 +101,53 @@ func TestRequest_Connect(t *testing.T) {
 	}
 }
 
+func TestRequest_Connect_Refused(t *testing.T) {
+	// Grab an ephemeral port and close the listener so that connecting
+	// to it is refused.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	deadPort := dead.Addr().(*net.TCPAddr).Port
+	dead.Close()
+
+	// Make server
+	s := &Server{config: &Config{
+		Rules:    PermitAll(),
+		Resolver: DNSResolver{},
+		Logger:   log.New(os.Stdout, "", log.LstdFlags),
+	}}
+
+	// Create the connect request
+	buf := bytes.NewBuffer(nil)
+	buf.Write([]byte{5, 1, 0, 1, 127, 0, 0, 1})
+	buf.Write([]byte{byte(deadPort >> 8), byte(deadPort & 0xff)})
+
+	resp := &MockConn{}
+	req, err := NewRequest(buf)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if err := s.handleRequest(req, resp); err == nil {
+		t.Fatal("expected an error for a refused connection")
+	}
+
+	// The reply must carry the connectionRefused code (0x05), mapped
+	// from syscall.ECONNREFUSED rather than from the error string.
+	out := resp.buf.Bytes()
+	expected := []byte{
+		socks5Version, connectionRefused,
+		0,
+		1,
+		0, 0, 0, 0,
+		0, 0,
+	}
+	if !bytes.Equal(out, expected) {
+		t.Fatalf("bad: %v %v", out, expected)
+	}
+}
+
 func TestRequest_Connect_RuleFail(t *testing.T) {
 	// Create a local listener
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -107,17 +157,20 @@ func TestRequest_Connect_RuleFail(t *testing.T) {
 	go func() {
 		conn, err := l.Accept()
 		if err != nil {
-			t.Fatalf("err: %v", err)
+			t.Errorf("err: %v", err)
+			return
 		}
 		defer conn.Close()
 
 		buf := make([]byte, 4)
 		if _, err := io.ReadAtLeast(conn, buf, 4); err != nil {
-			t.Fatalf("err: %v", err)
+			t.Errorf("err: %v", err)
+			return
 		}
 
 		if !bytes.Equal(buf, []byte("ping")) {
-			t.Fatalf("bad: %v", buf)
+			t.Errorf("bad: %v", buf)
+			return
 		}
 		conn.Write([]byte("pong"))
 	}()

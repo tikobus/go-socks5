@@ -3,6 +3,7 @@ package socks5
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -10,6 +11,53 @@ import (
 	"testing"
 	"time"
 )
+
+// dialRetry dials addr, retrying briefly until the server is accepting
+// connections, so tests do not depend on sleeps for synchronization.
+func dialRetry(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, err := net.Dial("tcp", addr)
+		if err == nil {
+			return conn
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failed to dial %s: %v", addr, err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestNew_DoesNotMutateConfig(t *testing.T) {
+	conf := &Config{}
+	serv, err := New(conf)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// The caller's Config must be left untouched...
+	if conf.AuthMethods != nil {
+		t.Fatal("caller Config.AuthMethods was mutated")
+	}
+	if conf.Resolver != nil {
+		t.Fatal("caller Config.Resolver was mutated")
+	}
+	if conf.Rules != nil {
+		t.Fatal("caller Config.Rules was mutated")
+	}
+	if conf.Logger != nil {
+		t.Fatal("caller Config.Logger was mutated")
+	}
+
+	// ...while the server must still work from its internal defaults.
+	if len(serv.config.AuthMethods) == 0 {
+		t.Fatal("server has no auth methods")
+	}
+	if serv.config.Rules == nil {
+		t.Fatal("server has no ruleset")
+	}
+}
 
 func TestSOCKS5_Connect(t *testing.T) {
 	// Create a local listener
@@ -20,17 +68,20 @@ func TestSOCKS5_Connect(t *testing.T) {
 	go func() {
 		conn, err := l.Accept()
 		if err != nil {
-			t.Fatalf("err: %v", err)
+			t.Errorf("err: %v", err)
+			return
 		}
 		defer conn.Close()
 
 		buf := make([]byte, 4)
 		if _, err := io.ReadAtLeast(conn, buf, 4); err != nil {
-			t.Fatalf("err: %v", err)
+			t.Errorf("err: %v", err)
+			return
 		}
 
 		if !bytes.Equal(buf, []byte("ping")) {
-			t.Fatalf("bad: %v", buf)
+			t.Errorf("bad: %v", buf)
+			return
 		}
 		conn.Write([]byte("pong"))
 	}()
@@ -50,21 +101,23 @@ func TestSOCKS5_Connect(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 
-	// Start listening
-	go func() {
-		if err := serv.ListenAndServe("tcp", "127.0.0.1:12365"); err != nil {
-			t.Fatalf("err: %v", err)
-		}
-	}()
-	time.Sleep(10 * time.Millisecond)
-
-	// Get a local conn
-	conn, err := net.Dial("tcp", "127.0.0.1:12365")
+	// Start listening on an ephemeral port
+	socksL, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
+	t.Cleanup(func() { socksL.Close() })
+	go func() {
+		// A closed listener is the normal teardown path, not a failure.
+		if err := serv.Serve(socksL); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("err: %v", err)
+		}
+	}()
 
-	// Connect, auth and connec to local
+	// Get a local conn, retrying until the server is accepting
+	conn := dialRetry(t, socksL.Addr().String())
+
+	// Connect, auth and connect to local
 	req := bytes.NewBuffer(nil)
 	req.Write([]byte{5})
 	req.Write([]byte{2, NoAuth, UserPassAuth})
