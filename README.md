@@ -44,3 +44,41 @@ if err := server.ListenAndServe("tcp", "127.0.0.1:8000"); err != nil {
 }
 ```
 
+A server requiring username/password authentication
+([RFC 1929](https://tools.ietf.org/html/rfc1929)) can be set up by
+providing a `CredentialStore`. A runnable version lives in
+[examples/auth-server](examples/auth-server/main.go):
+
+```go
+// Allowed username/password pairs
+creds := socks5.StaticCredentials{
+  "alice": "secret",
+  "bob":   "hunter2",
+}
+
+// Create a SOCKS5 server that requires user/pass authentication
+conf := &socks5.Config{
+  Credentials: creds,
+}
+server, err := socks5.New(conf)
+if err != nil {
+  panic(err)
+}
+
+// Create SOCKS5 proxy on localhost port 1080
+if err := server.ListenAndServe("tcp", "127.0.0.1:1080"); err != nil {
+  panic(err)
+}
+```
+
+Clients then authenticate with `user:pass`, e.g.
+`curl --socks5 alice:secret@127.0.0.1:1080 https://example.com`.
+For dynamic credential sources (database, LDAP, ...), implement the
+`CredentialStore` interface instead of using `StaticCredentials`:
+
+```go
+type CredentialStore interface {
+  Valid(user, password string) bool
+}
+```
+
